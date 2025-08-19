@@ -5,10 +5,10 @@ import math
 from collections import Counter
 import plotly.graph_objects as go
 
-# ================== Poker GTO Helper — Build v9d (Plotly table) ==================
+# ================== Poker GTO Helper — Build v9e (Plotly table + full action mix) ==================
 st.set_page_config(page_title="Poker GTO Helper", page_icon="♠️", layout="wide")
 st.title("♠️ Poker GTO Decision Helper")
-st.caption("Build: v9d • NEW: Plotly-rendered table (no HTML/iframe) for maximum compatibility on Streamlit Cloud")
+st.caption("Build: v9e • Plotly-rendered table • Auto-call allocation • Decision box shows all action percentages")
 
 # -------- Core cards --------
 Position = Literal["UTG", "MP", "CO", "BTN", "SB", "BB"]
@@ -24,6 +24,12 @@ PERSONALITIES = ["unknown","amateur-conservative","amateur-loose","professional-
 def _clamp(x: float, a: float=0.0, b: float=1.0) -> float: return max(a, min(b, x))
 def _sigmoid(x: float) -> float: return 1/(1+math.exp(-x))
 def _pct_round(x: float) -> int: return int(round(_clamp(x,0,1)*100/5)*5)
+
+def _normalize_probs(d: Dict[str, float]) -> Dict[str, float]:
+    tot = sum(max(0.0, v) for v in d.values())
+    if tot <= 1e-12:
+        return {k: 0.0 for k in d}
+    return {k: max(0.0, v)/tot for k, v in d.items()}
 
 def normalize_combo(hand: str) -> Tuple[str,str,str,bool]:
     h = hand.strip().upper()
@@ -163,6 +169,7 @@ def _range_advantage(prev_aggressor:str, texture:Dict[str,float]) -> float:
     adv += (0.6 - texture.get("wetness",0.4))
     adv -= 0.1 * texture.get("paired",0.0)
     return max(-0.3, min(0.5, adv))
+
 @dataclass
 class PostflopContext:
     street: Literal["flop","turn","river"]
@@ -176,38 +183,69 @@ class PostflopContext:
     prev_aggressor: Literal["hero","villain","none"] = "none"
     exploit_adv: float = 0.0
 
+# ================== Strategy (now returns full action mix) ==================
 def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:int, total_players:int,
                     facing_open:bool=False, open_size_bb:float=2.5, facing_shove:bool=False, shove_size_bb:float=0.0,
                     pot_before_hero_bb:float=0.0, exploit_adj:float=0.0) -> Dict[str,str]:
     combo, hi, lo, suited = normalize_combo(hand)
     bub = bubble_factor(players_left, total_players)
+
+    # Facing all-in
     if facing_shove and shove_size_bb>0:
         pot_before = pot_before_hero_bb if pot_before_hero_bb>0 else 1.5
         req = shove_size_bb / max(1e-9, (pot_before + shove_size_bb)) * bub
         s = chen_score(hi,lo,suited)
         diff = (s/20.0) - req + exploit_adj*0.05
         p_call = _clamp(0.5 + diff*2.0)
-        best = "CALL" if p_call>=0.5 else "FOLD"
-        best_pct = p_call if p_call>=0.5 else (1-p_call)
-        return {"primary":best,"best":best,"best_pct":best_pct,"mix":f"CALL {_pct_round(p_call)}% / FOLD {_pct_round(1-p_call)}%","explain":f"Pot-odds ~{req*100:.1f}%; Chen≈{s:.1f}. Exploit {exploit_adj:+.2f}"}
+        allp = _normalize_probs({"CALL": p_call, "RAISE": 0.0, "CHECK": 0.0, "FOLD": 1.0 - p_call})
+        best, best_p = max(allp.items(), key=lambda kv: kv[1])
+        return {
+            "primary": best, "best": best, "best_pct": best_p,
+            "mix": f"CALL {_pct_round(p_call)}% / FOLD {_pct_round(1-p_call)}%",
+            "all": allp,
+            "explain": f"Pot-odds ~{req*100:.1f}%; Chen≈{s:.1f}. Exploit {exploit_adj:+.2f}"
+        }
+
+    # Facing an open
     if facing_open:
         val, blf, call = _preflop_three_bet_split(hi,lo,suited,position,open_size_bb,stack_bb)
+        # Exploit adjustments
         val = _clamp(val + max(0, exploit_adj)*0.10)
         blf = _clamp(blf + max(0, exploit_adj)*0.05)
         call = _clamp(call + (-min(0, exploit_adj))*0.07)
         jam_share = _clamp((20 - stack_bb)/15.0) if stack_bb<20 else 0.0
-        parts=[]
+
+        parts = []
         def add(lbl,p):
             if p>0.02: parts.append((lbl,p))
         add("3B-VALUE", val*(1-jam_share)); add("JAM-VALUE", val*jam_share)
         add("3B-BLUFF", blf*(1-jam_share)); add("JAM-BLUFF", blf*jam_share)
         add("CALL", call)
         fold = _clamp(1.0 - sum(p for _,p in parts)); add("FOLD", fold)
+
+        # Aggregate to CALL / RAISE / CHECK / FOLD
+        agg = {"CALL":0.0,"RAISE":0.0,"CHECK":0.0,"FOLD":0.0}
+        for lbl,p in parts:
+            if lbl=="CALL": agg["CALL"] += p
+            elif lbl=="FOLD": agg["FOLD"] += p
+            else: agg["RAISE"] += p
+        allp = _normalize_probs(agg)
+
         if parts:
-            primary, primary_p = max(parts, key=lambda x:x[1]); mix = " / ".join([f"{l} {_pct_round(p)}%" for l,p in parts])
+            primary, primary_p = max(parts, key=lambda x:x[1])
+            mix = " / ".join([f"{l} {_pct_round(p)}%" for l,p in parts])
         else:
             primary, primary_p, mix = "FOLD", 1.0, "FOLD 100%"
-        return {"primary":primary,"best":primary,"best_pct":primary_p,"mix":mix,"explain":f"Stack {stack_bb:.0f}bb; exploit {exploit_adj:+.2f}"}
+
+        # Choose best among aggregated buckets for display as well
+        best_bucket, best_bucket_p = max(allp.items(), key=lambda kv: kv[1])
+        return {
+            "primary": primary, "best": best_bucket, "best_pct": best_bucket_p,
+            "mix": mix, "all": allp,
+            "explain": f"Stack {stack_bb:.0f}bb; exploit {exploit_adj:+.2f}"
+        }
+
+    # Unopened pot (hero first to act or folded to hero)
     f_open = _preflop_open_freq(hi,lo,suited,position,stack_bb,bub)
     f_open = _clamp(f_open + exploit_adj*0.06)
     p_open = f_open; p_fold = 1 - p_open
@@ -218,11 +256,22 @@ def gto_preflop_mix(hand:str, position:Position, stack_bb:float, players_left:in
         parts.append((f"OPEN {int(2.0 if position not in ('CO','BTN','SB') else 2.2)}bb", p_open*small))
         parts.append((("JAM" if stack_bb<=14 else "OPEN 2.8bb"), p_open*large))
     if p_fold>0.02: parts.append(("FOLD", p_fold))
+
     if parts:
         primary, primary_p = max(parts, key=lambda x:x[1]); mix = " / ".join([f"{l} {_pct_round(p)}%" for l,p in parts])
     else:
         primary, primary_p, mix = "FOLD", 1.0, "FOLD 100%"
-    return {"primary":primary,"best":primary,"best_pct":primary_p,"mix":mix,"explain":f"Chen; bubble x{bub:.2f}; exploit {exploit_adj:+.2f}"}
+
+    # Aggregate to buckets
+    agg = {"CALL":0.0,"RAISE":0.0,"CHECK":0.0,"FOLD":0.0}
+    for lbl,p in parts:
+        if lbl.startswith("OPEN") or "JAM" in lbl: agg["RAISE"] += p
+        elif lbl=="FOLD": agg["FOLD"] += p
+    allp = _normalize_probs(agg)
+
+    best_bucket, best_bucket_p = max(allp.items(), key=lambda kv: kv[1])
+    return {"primary":primary,"best":best_bucket,"best_pct":best_bucket_p,"mix":mix,"all":allp,
+            "explain":f"Chen; bubble x{bub:.2f}; exploit {exploit_adj:+.2f}"}
 
 def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
     hand = parse_cards(ctx.hero_hand); board = parse_cards(ctx.board_cards)
@@ -234,11 +283,14 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
     spr = max(0.01, ctx.eff_stack_bb / max(0.01, ctx.pot_bb))
     adv = _range_advantage(ctx.prev_aggressor, texture) + ctx.exploit_adv*0.10
     multiway_penalty = max(0, ctx.n_players - 2) * 0.15; adv -= 0.1 * max(0, ctx.n_players - 2)
+
     sizes = []
     if ctx.street=='flop': sizes = [(0.33, 0.5+adv), (0.66, 0.3-adv/2)]
     elif ctx.street=='turn': sizes = [(0.5, 0.45+adv/2), (0.66, 0.35-adv/4), (1.0, 0.2)]
     else: sizes = [(0.66, 0.4), (1.0, 0.35+adv/3)]
     total_prior = sum(max(0.0,p) for _,p in sizes); sizes = [(b, max(0.0,p)/max(1e-9,total_prior)) for b,p in sizes]
+
+    # Facing a bet
     if ctx.facing_bet_bb>0:
         bet = ctx.facing_bet_bb; pot = ctx.pot_bb
         mdf = _clamp(pot/(pot+bet)) * (1.0 - max(0, ctx.n_players-2)*0.15)
@@ -251,11 +303,16 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
         if p_continue < mdf:
             p_call = _clamp(p_call + (mdf - p_continue))
         p_fold = _clamp(1.0 - _clamp(p_call + p_raise))
-        opts=[("CALL",p_call),("RAISE",p_raise),("FOLD",p_fold)]
-        primary, primary_p = max(opts, key=lambda x:x[1])
-        return {"primary":primary,"best":primary,"best_pct":primary_p,
+
+        allp = _normalize_probs({"CALL": p_call, "RAISE": p_raise, "CHECK": 0.0, "FOLD": p_fold})
+        best, best_p = max(allp.items(), key=lambda kv: kv[1])
+
+        return {"primary":best,"best":best,"best_pct":best_p,
                 "mix":f"CALL {_pct_round(p_call)}% / RAISE {_pct_round(p_raise)}% / FOLD {_pct_round(p_fold)}%",
+                "all": allp,
                 "explain":f"{ctx.street.upper()} vs {bet:.1f} into {pot:.1f} | N={ctx.n_players} | hs~{hs*100:.0f}% | adv~{adv:+.2f} | SPR~{spr:.1f} | exploit {ctx.exploit_adv:+.2f}"}
+
+    # No bet faced: choose bet sizes vs check
     p_bet_total = _clamp(0.15 + adv + (hs-0.45)) * (1.0 - 0.6*max(0, ctx.n_players-2)*0.15)
     p_check = _clamp(1.0 - p_bet_total)
     bet_parts=[]; weight_sum=0.0
@@ -272,7 +329,15 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
             mix_parts.append((f"BET {int(b*100)}%", frac))
     mix_parts.append(("CHECK", p_check))
     mix_str = " / ".join([f"{lbl} {_pct_round(p)}%" for lbl,p in mix_parts])
-    return {"primary":primary,"best":primary,"best_pct":primary_p,"mix":mix_str,
+
+    # Aggregate to buckets for display
+    agg = {"CALL":0.0,"RAISE":0.0,"CHECK":p_check,"FOLD":0.0}
+    for lbl,p in mix_parts:
+        if lbl.startswith("BET"): agg["RAISE"] += p
+    allp = _normalize_probs(agg)
+    best_bucket, best_bucket_p = max(allp.items(), key=lambda kv: kv[1])
+
+    return {"primary":primary,"best":best_bucket,"best_pct":best_bucket_p,"mix":mix_str,"all":allp,
             "explain":f"{ctx.street.upper()} | N={ctx.n_players} | hs~{hs*100:.0f}% | adv~{adv:+.2f} | SPR~{spr:.1f} | exploit {ctx.exploit_adv:+.2f}"}
 
 def poker_decision_gto(*args, **kwargs): return gto_preflop_mix(*args, **kwargs)
@@ -447,11 +512,13 @@ def simulate_street(street_step:int, btn:int, seats:int, actions:Dict[int,Dict[s
         if t=="Fold":
             pass
         elif t=="Check/Call":
+            # AUTO-CALL: contribute exactly what is needed to match the current bet
             need = max(0.0, current_bet - prev)
             contribs[s] = prev + need
         elif t=="Bet/Raise":
+            # 'size' is the TARGET bet (not increment)
             target = max(current_bet, 0.0)
-            if street_step==0 and prev<1.0: target = max(1.0, target)
+            if street_step==0 and prev<1.0: target = max(1.0, target)  # behind blinds ensure ≥ BB
             target = max(target, size)
             need = max(0.0, target - prev)
             contribs[s] = prev + need
@@ -524,7 +591,7 @@ with col_right:
     if step>0: st.write(f"Prev street aggressor (auto): **{prev_aggressor_flag.upper()}**")
 
 if errs:
-    st.error("\\n".join([f"• {e}" for e in errs]))
+    st.error("\n".join([f"• {e}" for e in errs]))
     result = None
 else:
     if street=="preflop":
@@ -550,6 +617,14 @@ else:
     if result:
         pct = int(round(_clamp(result.get('best_pct',0.0),0.0,1.0)*100))
         st.success(f"{result.get('best','')} — {pct}%")
+        # NEW: show all action percentages (CALL / BET/RAISE / CHECK / FOLD)
+        allp = result.get("all", {})
+        if allp:
+            st.markdown("**Action mix**")
+            # order by percentage desc
+            for lbl, p in sorted(allp.items(), key=lambda kv: kv[1], reverse=True):
+                lab = "BET/RAISE" if lbl == "RAISE" else lbl
+                st.write(f"• {lab}: **{int(round(_clamp(p,0,1)*100))}%**")
         st.caption("Auto-updates if someone before you raises or if you act later in the order.")
 
 # ================== Live Table (Plotly) ==================
@@ -566,4 +641,4 @@ if back and step>0: st.session_state.step -= 1
 if nxt and step<3: st.session_state.step += 1
 
 st.markdown("<hr/>", unsafe_allow_html=True)
-st.caption("Plotly renderer avoids HTML/iframe issues on some hosts. Preflop pot starts at 1.5 BB (SB=0.5, BB=1.0).")
+st.caption("Plotly renderer avoids HTML/iframe issues. Preflop pot starts at 1.5 BB (SB=0.5, BB=1.0).")
