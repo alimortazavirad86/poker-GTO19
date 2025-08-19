@@ -137,13 +137,58 @@ def bubble_factor(players_left:int, total_players:int) -> float:
     if pct<=0.05: return 1.5
     if pct<=0.15: return 1.3
     return 1.0
+
+# ---------- FIXED: Unopened-pot open frequency (pocket-pair boost + late-position floors) ----------
 def _preflop_open_freq(hi:str, lo:str, suited:bool, position:Position, stack_bb:float, bubble_mult:float) -> float:
+    """
+    Baseline open frequency in unopened pots.
+    Tweaks:
+      • Pocket-pair boost (esp. 66–99 and TT+)
+      • Late-position bonus (CO/BTN/SB)
+      • Floors so pairs (like 88) don't get folded too often from CO/BTN/SB
+    """
     s = chen_score(hi,lo,suited)
+
+    # Pocket-pair boost
+    pair = (hi == lo)
+    if pair:
+        rv = RANK_TO_VAL[hi]
+        if rv >= 10:      # TT+
+            s += 2.0
+        elif rv >= 8:     # 88–99
+            s += 1.5
+        elif rv >= 6:     # 66–77
+            s += 1.0
+        else:             # 22–55
+            s += 0.5
+
+    # Late-position bonus
+    s += {"CO": 1.0, "BTN": 1.6, "SB": 0.6}.get(position, 0.0)
+
+    # Threshold by position/stack/bubble
     base_t = 12.0 * _POS_TIGHTNESS.get(position,1.0)
     if stack_bb<=12: base_t += 1.0
-    if stack_bb<=8: base_t += 1.0
+    if stack_bb<=8:  base_t += 1.0
     base_t *= bubble_mult
-    return _clamp(_sigmoid((s - base_t)/2.2))
+
+    f = _clamp(_sigmoid((s - base_t)/2.2))
+
+    # Floors for pairs in late positions
+    if pair:
+        rv = RANK_TO_VAL[hi]
+        if position == "BTN":
+            f = max(f, 0.55)            # any pair at least 55% open on BTN
+            if rv >= 8:                 # 88+
+                f = max(f, 0.70)
+        elif position == "CO":
+            f = max(f, 0.42)
+            if rv >= 8:
+                f = max(f, 0.58)
+        elif position == "SB":
+            f = max(f, 0.38)
+    return f
+# -----------------------------------------------------------------------------------------------
+
 def _preflop_three_bet_split(hi:str, lo:str, suited:bool, position:Position, vs_open_size_bb:float, stack_bb:float) -> Tuple[float,float,float]:
     s = chen_score(hi,lo,suited)
     t_val = 14.0 - (stack_bb-20)/40
@@ -310,7 +355,7 @@ def gto_postflop_mix(ctx: 'PostflopContext') -> Dict[str,str]:
         return {"primary":best,"best":best,"best_pct":best_p,
                 "mix":f"CALL {_pct_round(p_call)}% / RAISE {_pct_round(p_raise)}% / FOLD {_pct_round(p_fold)}%",
                 "all": allp,
-                "explain":f"{ctx.street.upper()} vs {bet:.1f} into {pot:.1f} | N={ctx.n_players} | hs~{hs*100:.0f}% | adv~{adv:+.2f} | SPR~{spr:.1f} | exploit {ctx.exploit_adv:+.2f}"}
+                "explain":f"{ctx.street.UPPER()} vs {bet:.1f} into {pot:.1f} | N={ctx.n_players} | hs~{hs*100:.0f}% | adv~{adv:+.2f} | SPR~{spr:.1f} | exploit {ctx.exploit_adv:+.2f}"}
 
     # No bet faced: choose bet sizes vs check
     p_bet_total = _clamp(0.15 + adv + (hs-0.45)) * (1.0 - 0.6*max(0, ctx.n_players-2)*0.15)
